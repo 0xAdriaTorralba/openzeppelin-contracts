@@ -1,0 +1,39 @@
+= ERC-7535
+
+https://eips.ethereum.org/EIPS/eip-7535[ERC-7535] is an adaptation of xref:erc4626.adoc[ERC-4626] in which the underlying asset of the vault is the chain's native asset (e.g. Ether) instead of an ERC-20 token. It keeps the ERC-4626 share-accounting model, rounding rules, and interface, so the same mental model, security considerations, and customizations apply, with a few native-asset specific differences.
+
+We provide a base implementation, `ERC7535`, that mirrors our `ERC4626` implementation — including the configurable virtual shares and assets used to mitigate the xref:erc4626.adoc#inflation-attack[inflation attack].
+
+== Differences with ERC-4626
+
+`ERC7535` behaves like `ERC4626`, with the following changes:
+
+* `asset()` returns the placeholder address `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE` defined by https://eips.ethereum.org/EIPS/eip-7528[ERC-7528], and the vault uses 18 decimals (those of the native asset) as its base before applying the optional decimals offset.
+* `deposit` and `mint` are `payable`. The native asset is provided as `msg.value` instead of being pulled with an ERC-20 `transferFrom`, so there is no allowance flow for the underlying asset. `deposit(assets, receiver)` requires `msg.value == assets`; `mint(shares, receiver)` requires `msg.value` to equal the previewed cost exactly (mirroring how `ERC4626.mint` pulls exactly `previewMint(shares)`), reverting otherwise.
+* Withdrawals and redemptions send the native asset out with a low-level `call` (xref:api:utils.adoc#Address-sendValue-address-payable-uint256-[`Address.sendValue`]) instead of an ERC-20 `transfer`.
+
+[source,solidity]
+----
+contract NativeVault is ERC7535 {
+    constructor() ERC20("Native Vault", "nvETH") {}
+}
+----
+
+IMPORTANT: A vault backed by a wrapped native asset (such as WETH9) MUST NOT use this contract. Per ERC-7528 and ERC-7535 such a vault is a plain xref:erc4626.adoc[ERC-4626] over the wrapper ERC-20 and must report that wrapper's address from `asset()`.
+
+== Accounting and `msg.value`
+
+`totalAssets()` returns `address(this).balance`. Because `deposit` and `mint` are `payable`, the deposited `msg.value` is already part of that balance when the exchange rate is computed — unlike an ERC-4626 vault, where the assets are only pulled in *after* the share amount is computed from the pre-deposit balance.
+
+To keep the behavior identical, `ERC7535` computes the exchange rate inside `deposit`/`mint` against `totalAssets() - msg.value` (the pre-call balance), while all preview and conversion functions use `totalAssets()` directly. As a result, a standalone `previewDeposit(assets)` returns exactly the number of shares a subsequent `deposit` of `assets` mints. The adjustment is applied at the `payable` call sites because `msg.value` cannot be read from a `view` function such as `totalAssets`.
+
+[[inflation-attack]]
+== Security concern: Inflation attack
+
+Native asset vaults are exposed to the same xref:erc4626.adoc#inflation-attack[donation / inflation attack] as ERC-4626 vaults, and `ERC7535` uses the same mitigation: configurable virtual shares and assets parameterized by `_decimalsOffset()`. The default offset of `0` makes the attack non-profitable, and a larger offset makes it orders of magnitude more expensive than profitable.
+
+Note that a native asset vault cannot keep its balance strictly equal to the sum of deposits: it can always be force-fed extra native asset, for example by being a block's `coinbase` or through the `SELFDESTRUCT` opcode. `totalAssets()` is balance-based and therefore tracks such donations, exactly like a direct ERC-20 transfer would for an ERC-4626 vault; the virtual-offset mitigation — not internal balance accounting — is the defense.
+
+== Security concern: Reentrancy
+
+Sending the native asset out uses a low-level `call`, which hands control to the receiver. `ERC7535` follows the checks-effects-interactions pattern: on withdrawals and redemptions the shares are burned *before* the value is sent, so a reentrant call observes a consistent, already-reduced share price. As in `ERC4626`, reentrancy safety relies on this ordering rather than on a reentrancy guard. Integrators adding custom logic to `_deposit`/`_withdraw` should preserve this ordering, or add an explicit reentrancy guard.
