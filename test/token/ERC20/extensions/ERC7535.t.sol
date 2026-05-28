@@ -97,17 +97,17 @@ contract ERC7535Test is Test {
     // Metadata / asset semantics
     // --------------------------------------------------------------------------------------------
 
-    function test_AssetSentinel() public view {
+    function testAssetSentinel() public view {
         assertEq(vault.asset(), 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);
     }
 
-    function testFuzz_Decimals(uint8 offset) public {
+    function testFuzzDecimals(uint8 offset) public {
         offset = uint8(bound(offset, 0, 30));
         ERC7535VaultMock v = new ERC7535VaultMock(offset);
         assertEq(v.decimals(), uint256(18) + offset);
     }
 
-    function test_TotalAssetsTracksBalance() public {
+    function testTotalAssetsTracksBalance() public {
         assertEq(vault.totalAssets(), 0);
         vm.deal(address(vault), 5 ether);
         assertEq(vault.totalAssets(), 5 ether);
@@ -117,7 +117,7 @@ contract ERC7535Test is Test {
     // msg.value enforcement
     // --------------------------------------------------------------------------------------------
 
-    function testFuzz_DepositRevertsOnValueMismatch(uint256 assets, uint256 value) public {
+    function testFuzzDepositRevertsOnValueMismatch(uint256 assets, uint256 value) public {
         assets = bound(assets, 0, MAX_ETH);
         value = bound(value, 0, MAX_ETH);
         vm.assume(assets != value);
@@ -126,7 +126,7 @@ contract ERC7535Test is Test {
         vault.deposit{value: value}(assets, victim);
     }
 
-    function testFuzz_MintRevertsOnValueMismatch(uint256 shares, uint256 value) public {
+    function testFuzzMintRevertsOnValueMismatch(uint256 shares, uint256 value) public {
         shares = bound(shares, 1, MAX_ETH);
         uint256 cost = vault.previewMint(shares); // empty vault, queried before sending value
         value = bound(value, 0, MAX_ETH);
@@ -141,7 +141,7 @@ contract ERC7535Test is Test {
     // This is the msg.value / totalAssets correctness property.
     // --------------------------------------------------------------------------------------------
 
-    function testFuzz_PreviewDepositEqualsMinted(uint256 seed, uint256 assets) public {
+    function testFuzzPreviewDepositEqualsMinted(uint256 seed, uint256 assets) public {
         // Seed the vault with some real balance and supply so totalAssets() and totalSupply() are non-trivial.
         seed = bound(seed, 0, MAX_ETH);
         if (seed != 0) {
@@ -162,7 +162,7 @@ contract ERC7535Test is Test {
         assertEq(vault.balanceOf(attacker), previewed);
     }
 
-    function testFuzz_PreviewMintEqualsActualCost(uint256 seed, uint256 shares) public {
+    function testFuzzPreviewMintEqualsActualCost(uint256 seed, uint256 shares) public {
         seed = bound(seed, 0, MAX_ETH);
         if (seed != 0) {
             vm.deal(address(this), seed);
@@ -185,7 +185,7 @@ contract ERC7535Test is Test {
     // Inflation / donation attack non-profitability at offset 0 (force-feed via vm.deal)
     // --------------------------------------------------------------------------------------------
 
-    function testFuzz_InflationAttackNotProfitable(uint256 donation, uint256 victimDeposit) public {
+    function testFuzzInflationAttackNotProfitable(uint256 donation, uint256 victimDeposit) public {
         // Offset-0 vault (default), fresh from setUp.
         donation = bound(donation, 0, MAX_ETH);
         victimDeposit = bound(victimDeposit, 1, MAX_ETH);
@@ -216,7 +216,7 @@ contract ERC7535Test is Test {
     // Round-trips: a user never extracts more than they put in.
     // --------------------------------------------------------------------------------------------
 
-    function testFuzz_DepositRedeemRoundTrip(uint256 seed, uint256 assets) public {
+    function testFuzzDepositRedeemRoundTrip(uint256 seed, uint256 assets) public {
         seed = bound(seed, 0, MAX_ETH);
         if (seed != 0) {
             vm.deal(address(this), seed);
@@ -234,7 +234,7 @@ contract ERC7535Test is Test {
         assertLe(redeemed, assets, "deposit->redeem extracted more than deposited");
     }
 
-    function testFuzz_MintRedeemRoundTrip(uint256 seed, uint256 shares) public {
+    function testFuzzMintRedeemRoundTrip(uint256 seed, uint256 shares) public {
         seed = bound(seed, 0, MAX_ETH);
         if (seed != 0) {
             vm.deal(address(this), seed);
@@ -259,7 +259,7 @@ contract ERC7535Test is Test {
     // convertToShares ∘ convertToAssets is a contraction (rounding favors the vault).
     // --------------------------------------------------------------------------------------------
 
-    function testFuzz_ConvertRoundTripContraction(uint256 seed, uint256 shares) public {
+    function testFuzzConvertRoundTripContraction(uint256 seed, uint256 shares) public {
         seed = bound(seed, 0, MAX_ETH);
         if (seed != 0) {
             vm.deal(address(this), seed);
@@ -274,7 +274,7 @@ contract ERC7535Test is Test {
         assertLe(backToShares, shares, "convertToShares(convertToAssets(s)) > s: rounding favored user");
     }
 
-    function testFuzz_ConvertAssetsRoundTripContraction(uint256 seed, uint256 assets) public {
+    function testFuzzConvertAssetsRoundTripContraction(uint256 seed, uint256 assets) public {
         seed = bound(seed, 1, MAX_ETH);
         vm.deal(address(this), seed);
         vault.deposit{value: seed}(seed, other);
@@ -291,7 +291,7 @@ contract ERC7535Test is Test {
     // Force-fed ETH does not break accounting (view functions still answer, withdraw still works).
     // --------------------------------------------------------------------------------------------
 
-    function testFuzz_ForceFedEthDoesNotBreakAccounting(uint256 deposit, uint256 forceFed) public {
+    function testFuzzForceFedEthDoesNotBreakAccounting(uint256 deposit, uint256 forceFed) public {
         deposit = bound(deposit, 1, MAX_ETH);
         forceFed = bound(forceFed, 0, MAX_ETH);
 
@@ -391,11 +391,11 @@ contract ERC7535Test is Test {
         assertEq(redeemed, otherPayout, "honest depositor could not redeem after attack");
     }
 
-    function test_ReentrancyWithdrawCannotOverDrain() public {
+    function testReentrancyWithdrawCannotOverDrain() public {
         _assertReentrancyCEI(ReentrantReceiver.Kind.Withdraw);
     }
 
-    function test_ReentrancyRedeemCannotOverDrain() public {
+    function testReentrancyRedeemCannotOverDrain() public {
         _assertReentrancyCEI(ReentrantReceiver.Kind.Redeem);
     }
 
@@ -403,7 +403,49 @@ contract ERC7535Test is Test {
     // Allowance path: third-party redeem must spend share allowance and cannot move another's shares.
     // --------------------------------------------------------------------------------------------
 
-    function test_ThirdPartyRedeemRequiresAllowance() public {
+    // --------------------------------------------------------------------------------------------
+    // N8: Plain native-asset transfers to the vault (via `.call{value:}("")` / `transfer` / `send`)
+    // hit the `receive()` and MUST revert with `ERC7535UnsolicitedDeposit`. Force-feeding via
+    // `SELFDESTRUCT` / coinbase / `vm.deal` is the documented limitation: it bypasses the EVM
+    // code path entirely and still works (totalAssets rises), which is what the inflation-attack
+    // analysis already accounts for.
+    // --------------------------------------------------------------------------------------------
+
+    function testPlainEthTransferRevertsWithUnsolicitedDeposit() public {
+        // Fund a caller and try a plain low-level transfer to the vault.
+        address sender = makeAddr("plainSender");
+        vm.deal(sender, 1 ether);
+
+        uint256 totalAssetsBefore = vault.totalAssets();
+        uint256 vaultBalBefore = address(vault).balance;
+
+        vm.prank(sender);
+        (bool ok, bytes memory ret) = address(vault).call{value: 1}("");
+
+        // The receive() reverts with ERC7535UnsolicitedDeposit; the low-level call returns false
+        // and the revert data carries the custom-error selector.
+        assertFalse(ok, "plain ETH transfer to vault should fail");
+        assertEq(
+            bytes4(ret),
+            ERC7535.ERC7535UnsolicitedDeposit.selector,
+            "revert selector should be ERC7535UnsolicitedDeposit"
+        );
+
+        // The vault's balance and totalAssets are unchanged (no value entered).
+        assertEq(address(vault).balance, vaultBalBefore, "vault balance changed despite revert");
+        assertEq(vault.totalAssets(), totalAssetsBefore, "totalAssets changed despite revert");
+
+        // Sender's wei is fully refunded by the revert (still has its full 1 ether).
+        assertEq(sender.balance, 1 ether, "sender lost ETH despite revert");
+
+        // Force-feeding via vm.deal (the SELFDESTRUCT / coinbase analogue) bypasses the EVM code
+        // path entirely and still raises totalAssets — documented limitation of the `receive()` guard.
+        uint256 forceFed = 7 ether;
+        vm.deal(address(vault), vaultBalBefore + forceFed);
+        assertEq(vault.totalAssets(), totalAssetsBefore + forceFed, "force-feed via vm.deal did not raise totalAssets");
+    }
+
+    function testThirdPartyRedeemRequiresAllowance() public {
         vm.deal(victim, 3 ether);
         vm.prank(victim);
         uint256 shares = vault.deposit{value: 3 ether}(3 ether, victim);

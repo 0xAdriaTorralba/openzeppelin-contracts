@@ -73,6 +73,32 @@ describe('ERC7535', function () {
     });
   });
 
+  describe('rejects plain ETH transfers', function () {
+    beforeEach(async function () {
+      this.vault = await ethers.deployContract('$ERC7535OffsetMock', [name, symbol, 0n]);
+      await setBalance(this.holder.address, ethers.parseEther('1000'));
+    });
+
+    it('receive() reverts with ERC7535UnsolicitedDeposit on a plain transfer', async function () {
+      await expect(this.holder.sendTransaction({ to: this.vault.target, value: 1n })).to.be.revertedWithCustomError(
+        this.vault,
+        'ERC7535UnsolicitedDeposit',
+      );
+    });
+
+    it('receive() reverts on a non-trivial plain transfer', async function () {
+      await expect(
+        this.holder.sendTransaction({ to: this.vault.target, value: ethers.parseEther('1') }),
+      ).to.be.revertedWithCustomError(this.vault, 'ERC7535UnsolicitedDeposit');
+    });
+
+    it('totalAssets does not increase after a rejected plain transfer', async function () {
+      const before = await this.vault.totalAssets();
+      await expect(this.holder.sendTransaction({ to: this.vault.target, value: 1n })).to.be.reverted;
+      expect(await this.vault.totalAssets()).to.equal(before);
+    });
+  });
+
   for (const offset of [0n, 6n, 18n]) {
     const parseAsset = asset => asset * 10n ** decimals;
     const parseShare = share => share * 10n ** (decimals + offset);
