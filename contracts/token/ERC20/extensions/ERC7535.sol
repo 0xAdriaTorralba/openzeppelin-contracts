@@ -80,55 +80,7 @@ import {Math} from "../../../utils/math/Math.sol";
  * * If {previewRedeem} is overridden to revert, {maxWithdraw} must be overridden as necessary to ensure it
  * always return successfully.
  *
- * * On entry to the `payable` {deposit} and {mint}, the incoming `msg.value` has already been credited to
- * `address(this).balance`, and therefore to {totalAssets}. To avoid counting the depositor's own Ether as
- * pre-existing assets (which would misprice the issued shares), all share math goes through {_convertToShares} /
- * {_convertToAssets}, which read the pre-call total from {_pretotalAssets}. In any non-`payable` context
- * `msg.value` is `0` and {_pretotalAssets} equals {totalAssets}, so the same conversion call yields the live
- * balance for public previews and the pre-call balance for the payable entrypoints. Off-chain previews must
- * still be performed *before* sending value, since the public `view` functions cannot account for an in-flight
- * `msg.value`.
- *
- * * {deposit} requires `msg.value == assets` and {mint} requires `msg.value == previewMint(shares)` exactly;
- * there is no refund path. ERC-7535 says `deposit` MAY ignore the `assets` argument, but ignoring it lets a
- * buggy integrator silently desync the amount they meant to send from the amount they actually paid, with no
- * way to detect it on-chain. Requiring strict equality surfaces the desync immediately as a typed revert
- * ({ERC7535UnexpectedDepositValue} / {ERC7535UnexpectedMintValue}) and keeps the emitted `Deposit` event
- * provably consistent with the wei that entered the Vault; the cost is one comparison and the loss of the
- * spec-permitted "MAY ignore" permissiveness, which the named error makes a safer trade.
- *
- * * The native asset is sent out on {withdraw}/{redeem} via {Address-sendValue}, which forwards all remaining
- * gas (so contract receivers like multisigs and AA wallets work, unlike the spec's suggested 2300-gas stipend).
- * The send is the last step of the checks-effects-interactions flow in {_withdraw} (allowance spent and shares
- * burned first), so a reentrant call from the receiver observes a consistent, already-reduced state. As in
- * `ERC4626`, reentrancy safety relies on this ordering rather than on a reentrancy guard. This contract
- * implements a {receive} function that reverts with {ERC7535UnsolicitedDeposit}, so plain transfers to it
- * fail loudly with a named reason. Note that the native asset can still be force-fed into the Vault
- * (e.g. through `SELFDESTRUCT` or block-reward payments) without minting shares, bypassing this guard.
- *
- * * Overrides of {_pretotalAssets} MUST return a value less than or equal to {totalAssets} in every context.
- * Overstating it inflates the share price during {deposit}/{mint}; understating it during a `view` call
- * misprices the public previews. Overrides of {_convertToShares}/{_convertToAssets} MUST go through
- * {_pretotalAssets} (do not read {totalAssets} or `msg.value` directly), otherwise the in-flight `msg.value`
- * is re-mixed into the rate and the rounding/skew bugs this seam is designed to prevent come back.
- *
- * * Overrides of {totalAssets} MUST NOT revert (ERC-4626 / ERC-7535 require it to return a value). When sourcing
- * the total from an external oracle, wrap the call in `try/catch` and return a safe fallback. Overstating
- * {totalAssets} will make {withdraw}/{redeem} attempt to send more than `address(this).balance` and revert
- * in `Address.sendValue`, locking exits until the balance catches up with the reported total.
- *
- * * Overrides of {_deposit} MUST NOT introduce an outbound native-asset call (e.g. a refund of "excess"
- * `msg.value`) before `_mint`: that reopens the reentrancy / refund-griefing class this design avoids by
- * requiring an exact `msg.value`. Overrides of {_withdraw} MUST preserve the checks-effects-interactions
- * ordering (allowance spent and shares burned BEFORE the outbound transfer).
- *
- * * Overrides of {_decimalsOffset} must keep the offset such that `18 + offset` fits in a `uint8` (i.e.
- * `offset <= 237`); larger values overflow {decimals}.
- *
- * * When overriding {maxDeposit} / {maxMint}, keep them consistent with any override of {previewDeposit} /
- * {previewMint}. The standard requires {previewDeposit} to act as though the deposit were accepted; a max that
- * disagrees with the preview produces misleading UI quotes. This is symmetric to the {maxWithdraw} / {maxRedeem}
- * consistency noted above.
+ * To learn more, check out our xref:ROOT:erc7535.adoc[ERC-7535 guide].
  * ====
  */
 abstract contract ERC7535 is ERC20, IERC7535 {
@@ -253,8 +205,6 @@ abstract contract ERC7535 is ERC20, IERC7535 {
             revert ERC7535ExceededMaxDeposit(receiver, assets, maxAssets);
         }
 
-        // `msg.value` is already part of `totalAssets()` on entry; `_convertToShares` reads {_pretotalAssets}
-        // so the share price is computed against the pre-call balance.
         uint256 shares = _convertToShares(assets, Math.Rounding.Floor);
         _deposit(_msgSender(), receiver, assets, shares);
 
@@ -268,8 +218,6 @@ abstract contract ERC7535 is ERC20, IERC7535 {
             revert ERC7535ExceededMaxMint(receiver, shares, maxShares);
         }
 
-        // `msg.value` is already part of `totalAssets()` on entry; `_convertToAssets` reads {_pretotalAssets}
-        // so the cost is computed against the pre-call balance.
         uint256 assets = _convertToAssets(shares, Math.Rounding.Ceil);
         if (msg.value != assets) {
             revert ERC7535UnexpectedMintValue(msg.value, assets);
@@ -321,31 +269,31 @@ abstract contract ERC7535 is ERC20, IERC7535 {
     }
 
     /**
-     * @dev Returns the value of {totalAssets} that the share math should price *against* — i.e. the contract's
-     * balance excluding any in-flight `msg.value` from the current `payable` call. In a non-`payable` context
-     * (every `view` call, and {withdraw}/{redeem}) `msg.value` is `0` and the result equals {totalAssets}; in
-     * the `payable` {deposit}/{mint} entrypoints the subtraction yields the pre-call balance, which is what
-     * {ERC4626}-style share math computes against. `msg.value` is not readable from a `view` function, hence
-     * this internal seam rather than folding the adjustment into {totalAssets} itself.
+     * @dev Returns the pre-call value of {totalAssets} the share math is priced against — i.e. the contract's
+     * balance excluding any in-flight `msg.value` from the current `payable` call. In any non-`payable` context
+     * `msg.value` is `0` and the result equals {totalAssets}; in {deposit}/{mint} the subtraction yields the
+     * pre-call balance. Overrides MUST return a value less than or equal to {totalAssets} and MUST be the only
+     * `totalAssets`-like value referenced by {_convertToShares}/{_convertToAssets}.
      */
     function _pretotalAssets() internal view virtual returns (uint256) {
         return totalAssets() - msg.value;
     }
 
     /**
-     * @dev Deposit/mint common workflow.
-     *
-     * The native asset has already been received with the call as `msg.value`, so there is no inbound transfer to
-     * perform; we only mint the shares and emit the event.
+     * @dev Deposit/mint common workflow. {_transferIn} is a no-op by default since the native asset has already
+     * been received as `msg.value`; the hook exists for parity with `ERC4626` so overrides can mirror that shape.
      */
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal virtual {
+        _transferIn(caller, assets);
         _mint(receiver, shares);
 
         emit Deposit(caller, receiver, assets, shares);
     }
 
     /**
-     * @dev Withdraw/redeem common workflow.
+     * @dev Withdraw/redeem common workflow. Spends the allowance and burns the shares BEFORE sending the native
+     * asset out: a reentrant call from the receiver observes an already-reduced share state. Overrides MUST
+     * preserve this ordering.
      */
     function _withdraw(
         address caller,
@@ -358,20 +306,24 @@ abstract contract ERC7535 is ERC20, IERC7535 {
             _spendAllowance(owner, caller, shares);
         }
 
-        // Follow checks-effects-interactions: spend allowance and burn the shares before sending the native asset out,
-        // so that any reentrancy from the recipient observes a consistent, reduced-share state.
         _burn(owner, shares);
         _transferOut(receiver, assets);
 
         emit Withdraw(caller, receiver, owner, assets, shares);
     }
 
-    /// @dev Performs a transfer out of the native asset. The default implementation uses `Address.sendValue`.
-    /// Used by {_withdraw}.
+    /// @dev Hook for transferring the native asset *into* the vault. No-op by default: value has already been
+    /// received as `msg.value`. Provided for symmetry with `ERC4626._transferIn`. Used by {_deposit}.
+    function _transferIn(address /* from */, uint256 /* assets */) internal virtual {}
+
+    /// @dev Performs a transfer out of the native asset. The default implementation uses `Address.sendValue`,
+    /// which forwards all remaining gas. Used by {_withdraw}.
     function _transferOut(address to, uint256 assets) internal virtual {
         Address.sendValue(payable(to), assets);
     }
 
+    /// @dev Overrides MUST keep `18 + offset` within `uint8` (i.e. `offset <= 237`); larger values overflow
+    /// {decimals}.
     function _decimalsOffset() internal view virtual returns (uint8) {
         return 0;
     }

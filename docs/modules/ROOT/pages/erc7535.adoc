@@ -61,3 +61,21 @@ Sending the native asset out uses a low-level `call` via xref:api:utils.adoc#Add
 Value must enter the vault through the standardized {deposit} or {mint} entry points so it is matched with newly issued shares. To make accidental misuse fail loudly, `ERC7535` implements a `receive()` function that reverts with the named error `ERC7535UnsolicitedDeposit`: plain `.transfer`, `.send` or `call{value: x}("")` to the vault revert with a reason wallets and UIs can decode, instead of being silently absorbed as a donation that would skew the next deposit's exchange rate.
 
 Note that this guard cannot stop the protocol-level force-feeds: native asset routed through `SELFDESTRUCT` or paid out as block-reward / `coinbase` tips bypasses `receive()` entirely and lands on `address(this).balance`. Because `totalAssets()` is balance-based, such donations are tracked exactly as a direct ERC-20 transfer would be for an ERC-4626 vault; the defense is the same virtual-offset math described in xref:#inflation-attack[Security concern: Inflation attack], not the `receive` revert.
+
+== Exact `msg.value` requirement
+
+`deposit(assets, receiver)` requires `msg.value == assets` and `mint(shares, receiver)` requires `msg.value == previewMint(shares)` exactly; there is no refund path. ERC-7535 says `deposit` MAY ignore the `assets` argument, but ignoring it lets a buggy integrator silently desync the amount they meant to send from the amount they actually paid, with no way to detect it on-chain. Requiring strict equality surfaces the desync immediately as a typed revert (`ERC7535UnexpectedDepositValue` / `ERC7535UnexpectedMintValue`) and keeps the emitted `Deposit` event provably consistent with the wei that entered the vault.
+
+== Override checklist
+
+When customizing `ERC7535`, keep the following invariants in mind in addition to the inherited ERC-4626 ones:
+
+* `_pretotalAssets()` MUST return a value less than or equal to `totalAssets()` in every context. Overstating it inflates the share price during `deposit`/`mint`; understating it during a `view` call misprices the public previews.
+* Custom `_convertToShares`/`_convertToAssets` MUST source the "total assets" value from `_pretotalAssets()` (not `totalAssets()` or `msg.value` directly). Otherwise the in-flight `msg.value` is re-mixed into the rate.
+* `totalAssets()` MUST NOT revert. When sourcing the total from an external oracle, wrap the call in `try/catch` and return a safe fallback. Overstating `totalAssets()` will make `withdraw`/`redeem` attempt to send more than `address(this).balance` and revert in `Address.sendValue`, locking exits until the balance catches up with the reported total.
+* `_deposit` overrides MUST NOT introduce an outbound native-asset call (e.g. a refund of "excess" `msg.value`) before `_mint`: that reopens the reentrancy / refund-griefing class this design avoids by requiring an exact `msg.value`.
+* `_withdraw` overrides MUST preserve the checks-effects-interactions ordering (allowance spent and shares burned BEFORE the outbound transfer).
+* `_decimalsOffset()` overrides must keep the offset such that `18 + offset` fits in a `uint8` (i.e. `offset <= 237`); larger values overflow `decimals()`.
+* `maxDeposit` / `maxMint` overrides must stay consistent with any override of `previewDeposit` / `previewMint`, symmetric to the `maxWithdraw` / `maxRedeem` consistency noted in the contract NatSpec.
+
+Off-chain previews must be performed *before* sending value, since the public `view` functions cannot account for an in-flight `msg.value`.
