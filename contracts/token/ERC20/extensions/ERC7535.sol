@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// OpenZeppelin Contracts (last updated v5.6.0) (token/ERC20/extensions/ERC7535.sol)
+// OpenZeppelin Contracts (last updated v5.7.0) (token/ERC20/extensions/ERC7535.sol)
 
 pragma solidity ^0.8.24;
 
@@ -82,25 +82,35 @@ import {Math} from "../../../utils/math/Math.sol";
  *
  * * On entry to the `payable` {deposit} and {mint}, the incoming `msg.value` has already been credited to
  * `address(this).balance`, and therefore to {totalAssets}. To avoid counting the depositor's own Ether as
- * pre-existing assets (which would misprice the issued shares), the share math in those functions is computed against
- * the pre-call total `totalAssets() - msg.value`. The public `view` functions ({convertToShares}, {previewDeposit},
- * etc.) call {totalAssets} directly and therefore reflect the live balance; off-chain previews must be performed
- * *before* the value is sent, as a `view` function cannot account for an in-flight `msg.value`.
+ * pre-existing assets (which would misprice the issued shares), all share math goes through {_convertToShares} /
+ * {_convertToAssets}, which read the pre-call total from {_pretotalAssets}. In any non-`payable` context
+ * `msg.value` is `0` and {_pretotalAssets} equals {totalAssets}, so the same conversion call yields the live
+ * balance for public previews and the pre-call balance for the payable entrypoints. Off-chain previews must
+ * still be performed *before* sending value, since the public `view` functions cannot account for an in-flight
+ * `msg.value`.
  *
- * * {deposit} requires `msg.value == assets` and {mint} requires `msg.value == previewMint(shares)` exactly; there is
- * no refund path. The native asset is sent out on {withdraw}/{redeem} via `Address.sendValue` as the last step of the
- * checks-effects-interactions flow in {_withdraw} (allowance spent and shares burned first), so a reentrant call
- * observes a consistent, already-reduced state. As in `ERC4626`, reentrancy safety relies on this ordering rather
- * than on a reentrancy guard. This contract implements a {receive} function that reverts with
- * {ERC7535UnsolicitedDeposit}, so plain transfers to it fail loudly with a named reason. Note that the native
- * asset can still be force-fed into the Vault (e.g. through `SELFDESTRUCT` or block-reward payments) without
- * minting shares, bypassing this guard.
+ * * {deposit} requires `msg.value == assets` and {mint} requires `msg.value == previewMint(shares)` exactly;
+ * there is no refund path. ERC-7535 says `deposit` MAY ignore the `assets` argument, but ignoring it lets a
+ * buggy integrator silently desync the amount they meant to send from the amount they actually paid, with no
+ * way to detect it on-chain. Requiring strict equality surfaces the desync immediately as a typed revert
+ * ({ERC7535UnexpectedDepositValue} / {ERC7535UnexpectedMintValue}) and keeps the emitted `Deposit` event
+ * provably consistent with the wei that entered the Vault; the cost is one comparison and the loss of the
+ * spec-permitted "MAY ignore" permissiveness, which the named error makes a safer trade.
  *
- * * Overrides of {_convertToShares} / {_convertToAssets} MUST use the `totalAssets_` argument they are given
- * and MUST NOT read {totalAssets} or `msg.value` directly inside them. The explicit pre-call total is what
- * lets {deposit} and {mint} price shares against the pre-call balance; reading the live {totalAssets} re-mixes
- * the in-flight `msg.value` into the rate and reintroduces the rounding/skew bugs this seam is designed to
- * prevent.
+ * * The native asset is sent out on {withdraw}/{redeem} via {Address-sendValue}, which forwards all remaining
+ * gas (so contract receivers like multisigs and AA wallets work, unlike the spec's suggested 2300-gas stipend).
+ * The send is the last step of the checks-effects-interactions flow in {_withdraw} (allowance spent and shares
+ * burned first), so a reentrant call from the receiver observes a consistent, already-reduced state. As in
+ * `ERC4626`, reentrancy safety relies on this ordering rather than on a reentrancy guard. This contract
+ * implements a {receive} function that reverts with {ERC7535UnsolicitedDeposit}, so plain transfers to it
+ * fail loudly with a named reason. Note that the native asset can still be force-fed into the Vault
+ * (e.g. through `SELFDESTRUCT` or block-reward payments) without minting shares, bypassing this guard.
+ *
+ * * Overrides of {_pretotalAssets} MUST return a value less than or equal to {totalAssets} in every context.
+ * Overstating it inflates the share price during {deposit}/{mint}; understating it during a `view` call
+ * misprices the public previews. Overrides of {_convertToShares}/{_convertToAssets} MUST go through
+ * {_pretotalAssets} (do not read {totalAssets} or `msg.value` directly), otherwise the in-flight `msg.value`
+ * is re-mixed into the rate and the rounding/skew bugs this seam is designed to prevent come back.
  *
  * * Overrides of {totalAssets} MUST NOT revert (ERC-4626 / ERC-7535 require it to return a value). When sourcing
  * the total from an external oracle, wrap the call in `try/catch` and return a safe fallback. Overstating
@@ -124,8 +134,8 @@ import {Math} from "../../../utils/math/Math.sol";
 abstract contract ERC7535 is ERC20, IERC7535 {
     using Math for uint256;
 
-    /// @dev The ERC-7528 placeholder address representing the native asset.
-    address public constant NATIVE_ASSET = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    /// @dev The ERC-7528 placeholder address representing the native asset; exposed through {asset}.
+    address private constant NATIVE_ASSET = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
 
     /**
      * @dev Attempted to deposit more assets than the max amount for `receiver`.
@@ -184,12 +194,12 @@ abstract contract ERC7535 is ERC20, IERC7535 {
 
     /// @inheritdoc IERC7535
     function convertToShares(uint256 assets) public view virtual returns (uint256) {
-        return _convertToShares(assets, totalAssets(), Math.Rounding.Floor);
+        return _convertToShares(assets, Math.Rounding.Floor);
     }
 
     /// @inheritdoc IERC7535
     function convertToAssets(uint256 shares) public view virtual returns (uint256) {
-        return _convertToAssets(shares, totalAssets(), Math.Rounding.Floor);
+        return _convertToAssets(shares, Math.Rounding.Floor);
     }
 
     /// @inheritdoc IERC7535
@@ -214,22 +224,22 @@ abstract contract ERC7535 is ERC20, IERC7535 {
 
     /// @inheritdoc IERC7535
     function previewDeposit(uint256 assets) public view virtual returns (uint256) {
-        return _convertToShares(assets, totalAssets(), Math.Rounding.Floor);
+        return _convertToShares(assets, Math.Rounding.Floor);
     }
 
     /// @inheritdoc IERC7535
     function previewMint(uint256 shares) public view virtual returns (uint256) {
-        return _convertToAssets(shares, totalAssets(), Math.Rounding.Ceil);
+        return _convertToAssets(shares, Math.Rounding.Ceil);
     }
 
     /// @inheritdoc IERC7535
     function previewWithdraw(uint256 assets) public view virtual returns (uint256) {
-        return _convertToShares(assets, totalAssets(), Math.Rounding.Ceil);
+        return _convertToShares(assets, Math.Rounding.Ceil);
     }
 
     /// @inheritdoc IERC7535
     function previewRedeem(uint256 shares) public view virtual returns (uint256) {
-        return _convertToAssets(shares, totalAssets(), Math.Rounding.Floor);
+        return _convertToAssets(shares, Math.Rounding.Floor);
     }
 
     /// @inheritdoc IERC7535
@@ -243,9 +253,9 @@ abstract contract ERC7535 is ERC20, IERC7535 {
             revert ERC7535ExceededMaxDeposit(receiver, assets, maxAssets);
         }
 
-        // `msg.value` is already part of `totalAssets()` on entry, so the share price is computed against the
-        // pre-call total.
-        uint256 shares = _convertToShares(assets, totalAssets() - msg.value, Math.Rounding.Floor);
+        // `msg.value` is already part of `totalAssets()` on entry; `_convertToShares` reads {_pretotalAssets}
+        // so the share price is computed against the pre-call balance.
+        uint256 shares = _convertToShares(assets, Math.Rounding.Floor);
         _deposit(_msgSender(), receiver, assets, shares);
 
         return shares;
@@ -258,8 +268,9 @@ abstract contract ERC7535 is ERC20, IERC7535 {
             revert ERC7535ExceededMaxMint(receiver, shares, maxShares);
         }
 
-        // `msg.value` is already part of `totalAssets()` on entry, so the cost is computed against the pre-call total.
-        uint256 assets = _convertToAssets(shares, totalAssets() - msg.value, Math.Rounding.Ceil);
+        // `msg.value` is already part of `totalAssets()` on entry; `_convertToAssets` reads {_pretotalAssets}
+        // so the cost is computed against the pre-call balance.
+        uint256 assets = _convertToAssets(shares, Math.Rounding.Ceil);
         if (msg.value != assets) {
             revert ERC7535UnexpectedMintValue(msg.value, assets);
         }
@@ -297,30 +308,28 @@ abstract contract ERC7535 is ERC20, IERC7535 {
 
     /**
      * @dev Internal conversion function (from assets to shares) with support for rounding direction.
-     *
-     * Takes the relevant total assets as an explicit argument so that the `view` functions can pass
-     * {totalAssets} while the `payable` {deposit}/{mint} can pass the pre-call total (`totalAssets() - msg.value`).
      */
-    function _convertToShares(
-        uint256 assets,
-        uint256 totalAssets_,
-        Math.Rounding rounding
-    ) internal view virtual returns (uint256) {
-        return assets.mulDiv(totalSupply() + 10 ** _decimalsOffset(), totalAssets_ + 1, rounding);
+    function _convertToShares(uint256 assets, Math.Rounding rounding) internal view virtual returns (uint256) {
+        return assets.mulDiv(totalSupply() + 10 ** _decimalsOffset(), _pretotalAssets() + 1, rounding);
     }
 
     /**
      * @dev Internal conversion function (from shares to assets) with support for rounding direction.
-     *
-     * Takes the relevant total assets as an explicit argument so that the `view` functions can pass
-     * {totalAssets} while the `payable` {deposit}/{mint} can pass the pre-call total (`totalAssets() - msg.value`).
      */
-    function _convertToAssets(
-        uint256 shares,
-        uint256 totalAssets_,
-        Math.Rounding rounding
-    ) internal view virtual returns (uint256) {
-        return shares.mulDiv(totalAssets_ + 1, totalSupply() + 10 ** _decimalsOffset(), rounding);
+    function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view virtual returns (uint256) {
+        return shares.mulDiv(_pretotalAssets() + 1, totalSupply() + 10 ** _decimalsOffset(), rounding);
+    }
+
+    /**
+     * @dev Returns the value of {totalAssets} that the share math should price *against* — i.e. the contract's
+     * balance excluding any in-flight `msg.value` from the current `payable` call. In a non-`payable` context
+     * (every `view` call, and {withdraw}/{redeem}) `msg.value` is `0` and the result equals {totalAssets}; in
+     * the `payable` {deposit}/{mint} entrypoints the subtraction yields the pre-call balance, which is what
+     * {ERC4626}-style share math computes against. `msg.value` is not readable from a `view` function, hence
+     * this internal seam rather than folding the adjustment into {totalAssets} itself.
+     */
+    function _pretotalAssets() internal view virtual returns (uint256) {
+        return totalAssets() - msg.value;
     }
 
     /**
