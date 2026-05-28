@@ -91,8 +91,34 @@ import {Math} from "../../../utils/math/Math.sol";
  * no refund path. The native asset is sent out on {withdraw}/{redeem} via `Address.sendValue` as the last step of the
  * checks-effects-interactions flow in {_withdraw} (allowance spent and shares burned first), so a reentrant call
  * observes a consistent, already-reduced state. As in `ERC4626`, reentrancy safety relies on this ordering rather
- * than on a reentrancy guard. This contract does not implement `receive` or `fallback`, so plain transfers to it
- * revert.
+ * than on a reentrancy guard. This contract implements a {receive} function that reverts with
+ * {ERC7535UnsolicitedDeposit}, so plain transfers to it fail loudly with a named reason. Note that the native
+ * asset can still be force-fed into the Vault (e.g. through `SELFDESTRUCT` or block-reward payments) without
+ * minting shares, bypassing this guard.
+ *
+ * * Overrides of {_convertToShares} / {_convertToAssets} MUST use the `totalAssets_` argument they are given
+ * and MUST NOT read {totalAssets} or `msg.value` directly inside them. The explicit pre-call total is what
+ * lets {deposit} and {mint} price shares against the pre-call balance; reading the live {totalAssets} re-mixes
+ * the in-flight `msg.value` into the rate and reintroduces the rounding/skew bugs this seam is designed to
+ * prevent.
+ *
+ * * Overrides of {totalAssets} MUST NOT revert (ERC-4626 / ERC-7535 require it to return a value). When sourcing
+ * the total from an external oracle, wrap the call in `try/catch` and return a safe fallback. Overstating
+ * {totalAssets} will make {withdraw}/{redeem} attempt to send more than `address(this).balance` and revert
+ * in `Address.sendValue`, locking exits until the balance catches up with the reported total.
+ *
+ * * Overrides of {_deposit} MUST NOT introduce an outbound native-asset call (e.g. a refund of "excess"
+ * `msg.value`) before `_mint`: that reopens the reentrancy / refund-griefing class this design avoids by
+ * requiring an exact `msg.value`. Overrides of {_withdraw} MUST preserve the checks-effects-interactions
+ * ordering (allowance spent and shares burned BEFORE the outbound transfer).
+ *
+ * * Overrides of {_decimalsOffset} must keep the offset such that `18 + offset` fits in a `uint8` (i.e.
+ * `offset <= 237`); larger values overflow {decimals}.
+ *
+ * * When overriding {maxDeposit} / {maxMint}, keep them consistent with any override of {previewDeposit} /
+ * {previewMint}. The standard requires {previewDeposit} to act as though the deposit were accepted; a max that
+ * disagrees with the preview produces misleading UI quotes. This is symmetric to the {maxWithdraw} / {maxRedeem}
+ * consistency noted above.
  * ====
  */
 abstract contract ERC7535 is ERC20, IERC7535 {
@@ -130,6 +156,11 @@ abstract contract ERC7535 is ERC20, IERC7535 {
      * @dev Attempted to {mint} with a `msg.value` that does not match the cost of the requested `shares`.
      */
     error ERC7535UnexpectedMintValue(uint256 value, uint256 cost);
+
+    /**
+     * @dev Reverts on a plain native-asset transfer to the vault — value enters only via {deposit} or {mint}.
+     */
+    error ERC7535UnsolicitedDeposit();
 
     /**
      * @dev Decimals are computed by adding the decimal offset on top of the native asset's decimals, which are fixed
@@ -334,5 +365,10 @@ abstract contract ERC7535 is ERC20, IERC7535 {
 
     function _decimalsOffset() internal view virtual returns (uint8) {
         return 0;
+    }
+
+    /// @dev Reverts on plain native-asset transfers; value must enter via {deposit} or {mint}.
+    receive() external payable {
+        revert ERC7535UnsolicitedDeposit();
     }
 }
