@@ -37,3 +37,9 @@ Note that a native asset vault cannot keep its balance strictly equal to the sum
 == Security concern: Reentrancy
 
 Sending the native asset out uses a low-level `call`, which hands control to the receiver. `ERC7535` follows the checks-effects-interactions pattern: on withdrawals and redemptions the shares are burned *before* the value is sent, so a reentrant call observes a consistent, already-reduced share price. As in `ERC4626`, reentrancy safety relies on this ordering rather than on a reentrancy guard. Integrators adding custom logic to `_deposit`/`_withdraw` should preserve this ordering, or add an explicit reentrancy guard.
+
+== Plain native-asset transfers
+
+Value must enter the vault through the standardized {deposit} or {mint} entry points so it is matched with newly issued shares. To make accidental misuse fail loudly, `ERC7535` implements a `receive()` function that reverts with the named error `ERC7535UnsolicitedDeposit`: plain `.transfer`, `.send` or `call{value: x}("")` to the vault revert with a reason wallets and UIs can decode, instead of being silently absorbed as a donation that would skew the next deposit's exchange rate.
+
+Note that this guard cannot stop the protocol-level force-feeds: native asset routed through `SELFDESTRUCT` or paid out as block-reward / `coinbase` tips bypasses `receive()` entirely and lands on `address(this).balance`. Because `totalAssets()` is balance-based, such donations are tracked exactly as a direct ERC-20 transfer would be for an ERC-4626 vault; the defense is the same virtual-offset math described in xref:#inflation-attack[Security concern: Inflation attack], not the `receive` revert.
