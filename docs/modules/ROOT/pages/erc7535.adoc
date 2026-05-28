@@ -19,6 +19,24 @@ contract NativeVault is ERC7535 {
 }
 ----
 
+To raise the resistance to the inflation attack, override `_decimalsOffset()`. A non-zero offset multiplies the virtual-shares term in the conversion formula, making a force-feed donation orders of magnitude more expensive than profitable (the trade-off is that a tiny portion of every yield accrual is captured by the virtual shares — see xref:#inflation-attack[Inflation attack]):
+
+[source,solidity]
+----
+contract HardenedNativeVault is ERC7535 {
+    constructor() ERC20("Hardened Native Vault", "hnvETH") {}
+
+    function _decimalsOffset() internal pure override returns (uint8) {
+        return 6;
+    }
+}
+----
+
+[TIP]
+====
+Prefer `deposit(assets, receiver)` over `mint(shares, receiver)` for an ETH-in flow. `mint` requires `msg.value` to equal `previewMint(shares)` *exactly*, and that previewed cost can change between the off-chain quote and the on-chain transaction (any donation, yield accrual, or other deposit in the same block shifts the rate). `deposit` lets the caller pin the wei they pay, so a same-block rate move at worst changes how many shares they get — not whether the call succeeds. (`mint` is the right choice when an integrator needs an exact share count and is OK with the call reverting if the rate has moved.)
+====
+
 IMPORTANT: A vault backed by a wrapped native asset (such as WETH9) MUST NOT use this contract. Per ERC-7528 and ERC-7535 such a vault is a plain xref:erc4626.adoc[ERC-4626] over the wrapper ERC-20 and must report that wrapper's address from `asset()`.
 
 == Accounting and `msg.value`
@@ -36,7 +54,7 @@ Note that a native asset vault cannot keep its balance strictly equal to the sum
 
 == Security concern: Reentrancy
 
-Sending the native asset out uses a low-level `call`, which hands control to the receiver. `ERC7535` follows the checks-effects-interactions pattern: on withdrawals and redemptions the shares are burned *before* the value is sent, so a reentrant call observes a consistent, already-reduced share price. As in `ERC4626`, reentrancy safety relies on this ordering rather than on a reentrancy guard. Integrators adding custom logic to `_deposit`/`_withdraw` should preserve this ordering, or add an explicit reentrancy guard.
+Sending the native asset out uses a low-level `call` via xref:api:utils.adoc#Address-sendValue-address-payable-uint256-[`Address.sendValue`], which forwards all remaining gas. The full-gas forward is deliberate: it keeps the vault compatible with smart-contract receivers (multisigs, account-abstraction wallets, proxies) whose `receive()` typically costs more than the spec's suggested 2300-gas stipend. The reentrancy risk that the full-gas forward opens is handled by the checks-effects-interactions pattern: on withdrawals and redemptions the shares are burned *before* the value is sent, so a reentrant call from the receiver observes a consistent, already-reduced share price. As in `ERC4626`, reentrancy safety relies on this ordering rather than on a reentrancy guard. Integrators adding custom logic to `_deposit`/`_withdraw` should preserve this ordering, or add an explicit reentrancy guard.
 
 == Plain native-asset transfers
 
