@@ -102,9 +102,17 @@ contract ERC7535Test is Test {
     }
 
     function testFuzzDecimals(uint8 offset) public {
-        offset = uint8(bound(offset, 0, 30));
+        // Bound across the full uint8 range so the fuzzer also exercises the documented overflow at
+        // 18 + offset > 255 (i.e. offset >= 238), mirroring the ERC4626 decimals overflow assertion.
+        offset = uint8(bound(offset, 0, 255));
         ERC7535VaultMock v = new ERC7535VaultMock(offset);
-        assertEq(v.decimals(), uint256(18) + offset);
+        if (uint256(18) + uint256(offset) > type(uint8).max) {
+            // 0x11 is the Panic code for arithmetic over/underflow.
+            vm.expectRevert(abi.encodeWithSignature("Panic(uint256)", 0x11));
+            v.decimals();
+        } else {
+            assertEq(v.decimals(), uint256(18) + offset);
+        }
     }
 
     function testTotalAssetsTracksBalance() public {
@@ -461,5 +469,150 @@ contract ERC7535Test is Test {
         vm.prank(attacker);
         vault.redeem(shares, attacker, victim);
         assertEq(vault.balanceOf(victim), 0);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Outbound send failure: receiver whose `receive()` reverts must bubble the failure,
+    // and the vault's accounting must be untouched (state rolled back).
+    // --------------------------------------------------------------------------------------------
+
+    function testFuzzWithdrawToRevertingReceiverReverts(uint256 assets) public {
+        assets = bound(assets, 1, MAX_ETH);
+        // Seed: a victim deposits so the vault has shares and balance.
+        vm.deal(victim, assets);
+        vm.prank(victim);
+        vault.deposit{value: assets}(assets, victim);
+
+        // Receiver whose `receive()` always reverts.
+        RevertingReceiver rj = new RevertingReceiver();
+
+        uint256 balanceBefore = address(vault).balance;
+        uint256 supplyBefore = vault.totalSupply();
+        uint256 sharesBefore = vault.balanceOf(victim);
+
+        vm.prank(victim);
+        vm.expectRevert();
+        vault.withdraw(assets, address(rj), victim);
+
+        // State unchanged: revert rolled everything back.
+        assertEq(address(vault).balance, balanceBefore, "balance changed on a reverted withdraw");
+        assertEq(vault.totalSupply(), supplyBefore, "totalSupply changed on a reverted withdraw");
+        assertEq(vault.balanceOf(victim), sharesBefore, "shares changed on a reverted withdraw");
+    }
+}
+
+/// @dev Receiver whose `receive` always reverts — used to drive `Address.sendValue` into its failure branch.
+contract RevertingReceiver {
+    receive() external payable {
+        revert("nope");
+    }
+}
+
+// =================================================================================================
+// Invariant test: a handler that randomly deposits / withdraws / donates / redeems, with the core
+// solvency and no-profit invariants asserted on top.
+// =================================================================================================
+
+/// @dev Handler driving randomized vault interactions for the invariant suite. Tracks per-actor and
+/// global accounting so the invariants below can pin solvency and no-profit properties.
+contract ERC7535Handler is Test {
+    ERC7535VaultMock public vault;
+
+    address[] public actors;
+    mapping(address => uint256) public netInvested; // sum(deposits) − sum(redeemPayouts)
+    uint256 public totalDonated;
+
+    constructor(ERC7535VaultMock vault_, address[] memory actors_) {
+        vault = vault_;
+        actors = actors_;
+    }
+
+    function _pickActor(uint256 seed) internal view returns (address) {
+        return actors[seed % actors.length];
+    }
+
+    function handlerDeposit(uint256 seed, uint256 assets) external {
+        address actor = _pickActor(seed);
+        assets = bound(assets, 0, 1e22);
+        vm.deal(actor, actor.balance + assets);
+        vm.prank(actor);
+        vault.deposit{value: assets}(assets, actor);
+        netInvested[actor] += assets;
+    }
+
+    function handlerRedeem(uint256 seed, uint256 shares) external {
+        address actor = _pickActor(seed);
+        uint256 maxShares = vault.maxRedeem(actor);
+        if (maxShares == 0) return;
+        shares = bound(shares, 0, maxShares);
+        uint256 balBefore = actor.balance;
+        vm.prank(actor);
+        vault.redeem(shares, actor, actor);
+        uint256 payout = actor.balance - balBefore;
+        if (payout >= netInvested[actor]) {
+            netInvested[actor] = 0;
+        } else {
+            netInvested[actor] -= payout;
+        }
+    }
+
+    function handlerDonate(uint256 amount) external {
+        amount = bound(amount, 0, 1e18);
+        // Force-feed (SELFDESTRUCT/coinbase analogue): raises balance without minting shares.
+        vm.deal(address(vault), address(vault).balance + amount);
+        totalDonated += amount;
+    }
+
+    function sumNetInvested() external view returns (uint256 sum) {
+        for (uint256 i; i < actors.length; ++i) sum += netInvested[actors[i]];
+    }
+}
+
+contract ERC7535InvariantTest is Test {
+    ERC7535VaultMock internal vault;
+    ERC7535Handler internal handler;
+    address[] internal actors;
+
+    function setUp() public {
+        vault = new ERC7535VaultMock(0);
+
+        actors = new address[](3);
+        actors[0] = makeAddr("alice");
+        actors[1] = makeAddr("bob");
+        actors[2] = makeAddr("carol");
+
+        handler = new ERC7535Handler(vault, actors);
+
+        // Target only the handler's three entry points for the invariant runner.
+        bytes4[] memory selectors = new bytes4[](3);
+        selectors[0] = handler.handlerDeposit.selector;
+        selectors[1] = handler.handlerRedeem.selector;
+        selectors[2] = handler.handlerDonate.selector;
+        targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
+        targetContract(address(handler));
+    }
+
+    /// @dev Solvency: the vault's native balance must always cover what every holder could redeem RIGHT NOW.
+    function invariantSolvency() public view {
+        uint256 owed = 0;
+        for (uint256 i; i < actors.length; ++i) {
+            owed += vault.previewRedeem(vault.balanceOf(actors[i]));
+        }
+        assertGe(address(vault).balance, owed, "vault balance < sum(previewRedeem(holders))");
+    }
+
+    /// @dev No value creation: the sum of currently-redeemable assets across holders is bounded by what they
+    /// actually put in plus what was donated (virtual-offset captures a sliver of donations; holders never
+    /// extract more than the deposits + donations together).
+    function invariantNoValueCreation() public view {
+        uint256 redeemable = 0;
+        for (uint256 i; i < actors.length; ++i) {
+            redeemable += vault.previewRedeem(vault.balanceOf(actors[i]));
+        }
+        assertLe(
+            redeemable,
+            handler.sumNetInvested() + handler.totalDonated(),
+            "holders can extract more than was put in"
+        );
     }
 }

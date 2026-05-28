@@ -1,6 +1,7 @@
 const { ethers } = require('hardhat');
 const { expect } = require('chai');
 const { loadFixture, setBalance } = require('@nomicfoundation/hardhat-network-helpers');
+const { PANIC_CODES } = require('@nomicfoundation/hardhat-chai-matchers/panic');
 
 const name = 'My Native Vault';
 const symbol = 'MNV';
@@ -96,6 +97,60 @@ describe('ERC7535', function () {
       const before = await this.vault.totalAssets();
       await expect(this.holder.sendTransaction({ to: this.vault.target, value: 1n })).to.be.reverted;
       expect(await this.vault.totalAssets()).to.equal(before);
+    });
+  });
+
+  describe('decimals overflow', function () {
+    // Mirrors the equivalent ERC4626 test: decimals = 18 + _decimalsOffset(), so any offset that pushes the
+    // sum above 255 must overflow the uint8 return type.
+    for (const offset of [238n, 243n, 250n, 255n]) {
+      it(`reverts at offset ${offset}`, async function () {
+        const vault = await ethers.deployContract('$ERC7535OffsetMock', [name, symbol, offset]);
+        await expect(vault.decimals()).to.be.revertedWithPanic(PANIC_CODES.ARITHMETIC_UNDER_OR_OVERFLOW);
+      });
+    }
+  });
+
+  describe('outbound send failure', function () {
+    beforeEach(async function () {
+      this.vault = await ethers.deployContract('$ERC7535OffsetMock', [name, symbol, 0n]);
+      await setBalance(this.holder.address, ethers.parseEther('10'));
+      await this.vault.connect(this.holder).deposit(ethers.parseEther('1'), this.holder, {
+        value: ethers.parseEther('1'),
+      });
+      // A contract whose `receive()` always reverts — exercises the `Address.sendValue` failure path.
+      this.rejector = await ethers.deployContract('$EtherReceiverMock');
+      await this.rejector.setAcceptEther(false);
+    });
+
+    it('withdraw to a receiver whose receive() reverts bubbles the failure', async function () {
+      await expect(this.vault.connect(this.holder).withdraw(ethers.parseEther('1'), this.rejector, this.holder)).to.be
+        .reverted;
+    });
+
+    it('redeem to a receiver whose receive() reverts bubbles the failure', async function () {
+      const shares = await this.vault.balanceOf(this.holder);
+      await expect(this.vault.connect(this.holder).redeem(shares, this.rejector, this.holder)).to.be.reverted;
+    });
+  });
+
+  describe('receiver == address(0) (documenting test)', function () {
+    // ERC4626 / ERC7535 don't require receiver != address(0) on withdraw/redeem; pin the current behavior
+    // (ETH sent to the zero address, which has no code and accepts the value silently) so a future change
+    // is forced to be deliberate.
+    beforeEach(async function () {
+      this.vault = await ethers.deployContract('$ERC7535OffsetMock', [name, symbol, 0n]);
+      await setBalance(this.holder.address, ethers.parseEther('10'));
+      await this.vault.connect(this.holder).deposit(ethers.parseEther('1'), this.holder, {
+        value: ethers.parseEther('1'),
+      });
+    });
+
+    it('withdraw to address(0) succeeds and sends value to the zero address', async function () {
+      const value = ethers.parseEther('1');
+      const tx = this.vault.connect(this.holder).withdraw(value, ethers.ZeroAddress, this.holder);
+      await expect(tx).to.changeEtherBalances([this.vault, ethers.ZeroAddress], [-value, value]);
+      await expect(tx).to.emit(this.vault, 'Withdraw');
     });
   });
 
