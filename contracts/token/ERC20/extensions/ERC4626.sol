@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
-// OpenZeppelin Contracts (last updated v5.6.0) (token/ERC20/extensions/ERC4626.sol)
+// OpenZeppelin Contracts (last updated v5.7.0) (token/ERC20/extensions/ERC4626.sol)
 
 pragma solidity ^0.8.24;
 
-import {IERC20, IERC20Metadata, ERC20} from "../ERC20.sol";
-import {SafeERC20} from "../utils/SafeERC20.sol";
 import {IERC4626} from "../../../interfaces/IERC4626.sol";
 import {Math} from "../../../utils/math/Math.sol";
+import {IERC20, IERC20Metadata, ERC20} from "../ERC20.sol";
+import {SafeERC20} from "../utils/SafeERC20.sol";
 
 /**
  * @dev Implementation of the ERC-4626 "Tokenized Vault Standard" as defined in
@@ -64,6 +64,14 @@ import {Math} from "../../../utils/math/Math.sol";
  * * If {previewRedeem} is overridden to revert, {maxWithdraw} must be overridden as necessary to ensure it
  * always return successfully.
  * ====
+ *
+ * [CAUTION]
+ * ====
+ * Any mechanism that mints shares without a corresponding increase in the vault's assets (collateral) will alter the
+ * exchange rate and may open the door to vulnerabilities. In particular, this contract
+ * must NOT be combined with {ERC20FlashMint}: flash-minting shares temporarily inflates the total supply without
+ * increasing collateral, corrupting the exchange rate applied during the flash loan.
+ * ====
  */
 abstract contract ERC4626 is ERC20, IERC4626 {
     using Math for uint256;
@@ -90,6 +98,13 @@ abstract contract ERC4626 is ERC20, IERC4626 {
      * @dev Attempted to redeem more shares than the max amount for `owner`.
      */
     error ERC4626ExceededMaxRedeem(address owner, uint256 shares, uint256 max);
+
+    /**
+     * @dev Attempted to {deposit} or {mint} with a native value (`msg.value`) the vault does not expect. The
+     * default {_checkPayment} reverts with this error on any non-zero `msg.value`; native-asset vaults (see
+     * ERC-7535) override {_checkPayment} and do not use it.
+     */
+    error ERC4626UnexpectedNativeValue(uint256 value);
 
     /**
      * @dev Set the underlying asset contract. This must be an ERC20-compatible contract (ERC-20 or ERC-777).
@@ -172,26 +187,28 @@ abstract contract ERC4626 is ERC20, IERC4626 {
     }
 
     /// @inheritdoc IERC4626
-    function deposit(uint256 assets, address receiver) public virtual returns (uint256) {
+    function deposit(uint256 assets, address receiver) public payable virtual returns (uint256) {
         uint256 maxAssets = maxDeposit(receiver);
         if (assets > maxAssets) {
             revert ERC4626ExceededMaxDeposit(receiver, assets, maxAssets);
         }
 
         uint256 shares = previewDeposit(assets);
+        _checkPayment(assets);
         _deposit(_msgSender(), receiver, assets, shares);
 
         return shares;
     }
 
     /// @inheritdoc IERC4626
-    function mint(uint256 shares, address receiver) public virtual returns (uint256) {
+    function mint(uint256 shares, address receiver) public payable virtual returns (uint256) {
         uint256 maxShares = maxMint(receiver);
         if (shares > maxShares) {
             revert ERC4626ExceededMaxMint(receiver, shares, maxShares);
         }
 
         uint256 assets = previewMint(shares);
+        _checkPayment(assets);
         _deposit(_msgSender(), receiver, assets, shares);
 
         return assets;
@@ -288,6 +305,17 @@ abstract contract ERC4626 is ERC20, IERC4626 {
     /// @dev Performs a transfer out of underlying assets. The default implementation uses `SafeERC20`. Used by {_withdraw}.
     function _transferOut(address to, uint256 assets) internal virtual {
         SafeERC20.safeTransfer(IERC20(asset()), to, assets);
+    }
+
+    /// @dev Validates the native value (`msg.value`) sent with a {deposit} or {mint} call. The `uint256` argument
+    /// is the amount being deposited (or the cost of the shares being minted), expressed in the underlying asset.
+    ///
+    /// {deposit} and {mint} are `payable` so that vaults whose underlying IS the chain's native asset (see
+    /// ERC-7535) can receive it as `msg.value`. The default implementation, used by ERC-20 vaults, expects no
+    /// native value and reverts if any is sent — preserving the behavior of a non-`payable` entry point. Native
+    /// asset vaults override this to require `msg.value` to cover the deposited amount.
+    function _checkPayment(uint256) internal virtual {
+        if (msg.value != 0) revert ERC4626UnexpectedNativeValue(msg.value);
     }
 
     function _decimalsOffset() internal view virtual returns (uint8) {
