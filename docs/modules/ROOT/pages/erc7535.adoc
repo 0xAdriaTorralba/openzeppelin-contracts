@@ -40,7 +40,7 @@ ERC-4626's `deposit` and `mint` are declared `payable` on `IERC4626` (this does 
 
 * `_checkPayment(uint256 assets)`: validates the native value. The `ERC4626` default expects none and reverts on any `msg.value`; `ERC7535` overrides it to require `msg.value` to cover the deposit. A plain ERC-20 vault is therefore unchanged — it still rejects native value.
 * `_transferIn` / `_transferOut`: `ERC7535` makes `_transferIn` a no-op (the value already arrived as `msg.value`) and routes `_transferOut` through `Address.sendValue`.
-* `_deposit`: `ERC7535` refunds any excess `msg.value` (on `mint`) after the shares are minted. See <<msg-value-requirement>>.
+* `mint`: `ERC7535` refunds any excess `msg.value` after `_deposit` returns. See <<msg-value-requirement>>.
 
 == Accounting and `msg.value`
 
@@ -48,7 +48,7 @@ Because `deposit` and `mint` are `payable`, the deposited `msg.value` is already
 
 To keep the behavior identical, `totalAssets()` returns `address(this).balance - msg.value`. Outside a `payable` call `msg.value` is `0` and this is the full balance; inside `deposit` and `mint` it is the pre-call balance. The share conversion and preview functions are inherited unchanged from `ERC4626`, so a standalone `previewDeposit(value)` returns exactly the number of shares a subsequent `deposit` with `msg.value == value` mints.
 
-Note that within a `deposit` or `mint` call, `totalAssets()` excludes the whole `msg.value` for the duration of the call, including after the shares are minted and any excess refunded. Custom logic that runs in that call after `_mint` (for example in a `_deposit` or `_update` override) sees the new `totalSupply()` against the pre-deposit `totalAssets()`. A reentrant call is not affected: it has its own `msg.value`.
+Note that within a `deposit` or `mint` call, `totalAssets()` excludes the whole `msg.value` for the duration of the call. Custom logic that runs in that call after `_mint` (for example in a `_deposit` or `_update` override) sees the new `totalSupply()` against the pre-deposit `totalAssets()`. A reentrant call is not affected: it has its own `msg.value`. The excess of a `mint` is refunded after `_deposit` returns, so only code that runs in a `mint` override after `super.mint` sees a `totalAssets()` lowered by the refunded amount.
 
 [[inflation-attack]]
 == Security concern: Inflation attack
@@ -72,7 +72,7 @@ Note that protocol-level force-feeds cannot be prevented: native asset routed th
 [[msg-value-requirement]]
 == The `msg.value` requirement
 
-`deposit(assets, receiver)` deposits the entire `msg.value` and prices shares off it, ignoring the `assets` argument (per ERC-7535): there is no underpayment to revert on and no excess to retain — the full value sent is always converted to `previewDeposit(msg.value)` shares. `mint(shares, receiver)` instead requires `msg.value >= previewMint(shares)` and reverts with the typed error `ERC7535InsufficientNativeValue` if too little is sent; any *excess* `msg.value` on a `mint` is refunded to the caller. The refund is sent at the end of `_deposit`, after the shares are minted, so that a reentrant call made during the refund sees a `totalAssets()` and `totalSupply()` that both account for the deposit. The refund forwards all remaining gas; a caller that cannot receive it only causes its own `mint` to revert. Prefer `deposit` over `mint` for an ETH-in flow, since `deposit` consumes exactly the value sent, while `previewMint` can shift between an off-chain quote and the on-chain transaction.
+`deposit(assets, receiver)` deposits the entire `msg.value` and prices shares off it, ignoring the `assets` argument (per ERC-7535): there is no underpayment to revert on and no excess to retain — the full value sent is always converted to `previewDeposit(msg.value)` shares. `mint(shares, receiver)` instead requires `msg.value >= previewMint(shares)` and reverts with the typed error `ERC7535InsufficientNativeValue` if too little is sent; any *excess* `msg.value` on a `mint` is refunded to the caller. The refund is sent at the end of `mint`, after the shares are minted, so that a reentrant call made during the refund sees a `totalAssets()` and `totalSupply()` that both account for the deposit. The refund forwards all remaining gas; a caller that cannot receive it only causes its own `mint` to revert. Prefer `deposit` over `mint` for an ETH-in flow, since `deposit` consumes exactly the value sent, while `previewMint` can shift between an off-chain quote and the on-chain transaction.
 
 == Override checklist
 
