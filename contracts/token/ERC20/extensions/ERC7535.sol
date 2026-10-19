@@ -72,9 +72,12 @@ abstract contract ERC7535 is ERC4626 {
      *
      * @dev Excludes the `msg.value` of the current call, so that {deposit} and {mint} price shares against the
      * pre-deposit balance (and a standalone {previewDeposit} matches the subsequent {deposit}). Outside a `payable`
-     * call, `msg.value` is `0` and this is the full balance. Within {deposit} and {mint}, the whole `msg.value` is
-     * excluded for the duration of the call. Code that runs in a {mint} override after `super.mint` sees a value
-     * lowered by the refunded excess.
+     * call, `msg.value` is `0` and this is the full balance.
+     *
+     * WARNING: When extending this contract, consider that native asset sent out during a `payable` call, such as
+     * the refund of an overpaid {mint}, is still subtracted through `msg.value`. For the rest of that call,
+     * {totalAssets} returns a value lowered by the amount sent, and reverts if that amount exceeds the pre-deposit
+     * balance.
      */
     function totalAssets() public view virtual override returns (uint256) {
         return address(this).balance - _msgValue();
