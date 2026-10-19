@@ -2,7 +2,7 @@
 
 https://eips.ethereum.org/EIPS/eip-7535[ERC-7535] is an adaptation of xref:erc4626.adoc[ERC-4626] in which the underlying asset of the vault is the chain's native asset (e.g. Ether) instead of an ERC-20 token. It keeps the ERC-4626 share-accounting model, rounding rules, and interface, so the same mental model, security considerations, and customizations apply, with a few native-asset specific differences.
 
-`ERC7535` is implemented as a thin extension of `ERC4626`: share accounting, rounding, the virtual-shares inflation mitigation, the preview functions, and the checks-effects-interactions withdraw path are all inherited. Only the asset-movement seams change.
+`ERC7535` is implemented as a thin extension of `ERC4626`: share accounting, rounding, the virtual-shares inflation mitigation, the preview functions, and the checks-effects-interactions withdraw path are all inherited.
 
 == Differences with ERC-4626
 
@@ -38,7 +38,7 @@ IMPORTANT: A vault backed by a wrapped native asset (such as WETH9) MUST NOT use
 
 ERC-4626's `deposit` and `mint` are declared `payable` on `IERC4626` (this does not change their selectors or the ERC-165 interface id) and route through virtual hooks that `ERC7535` overrides:
 
-* `_checkPayment(uint256 assets)`: validates the native value. The `ERC4626` default expects none and reverts on any `msg.value`; `ERC7535` overrides it to require `msg.value` to cover the deposit. A plain ERC-20 vault is therefore unchanged — it still rejects native value.
+* `_checkNativeValue(uint256 assets)`: validates the native value. The `ERC4626` default expects none and reverts on any `msg.value`; `ERC7535` overrides it to require `msg.value` to cover the deposit. A plain ERC-20 vault is therefore unchanged — it still rejects native value.
 * `_transferIn` / `_transferOut`: `ERC7535` makes `_transferIn` a no-op (the value already arrived as `msg.value`) and routes `_transferOut` through `Address.sendValue`.
 * `mint`: `ERC7535` refunds any excess `msg.value` after `_deposit` returns. See <<msg-value-requirement>>.
 
