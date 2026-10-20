@@ -108,7 +108,8 @@ abstract contract ERC7535 is ERC4626 {
      * @inheritdoc IERC4626
      *
      * @dev Refunds any `msg.value` in excess of the returned `assets` to the caller. The refund runs after
-     * {_deposit} returns, so {_deposit} overrides and reentrant calls see a {totalAssets} that matches the balance.
+     * {_deposit} returns, so a {_deposit} override sees the pre-deposit {totalAssets}, and a reentrant call during
+     * the refund sees a {totalAssets} and {totalSupply} that both account for this deposit.
      */
     function mint(uint256 shares, address receiver) public payable virtual override returns (uint256) {
         uint256 assets = super.mint(shares, receiver);
