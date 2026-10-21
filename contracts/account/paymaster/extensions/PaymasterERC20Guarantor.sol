@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.7.0) (account/paymaster/extensions/PaymasterERC20Guarantor.sol)
 
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.31;
 
-import {ERC4337Utils, PackedUserOperation} from "../../utils/ERC4337Utils.sol";
 import {IERC20, SafeERC20} from "../../../token/ERC20/utils/SafeERC20.sol";
 import {Math} from "../../../utils/math/Math.sol";
+import {ERC4337Utils, PackedUserOperation} from "../../utils/ERC4337Utils.sol";
 import {PaymasterERC20} from "./PaymasterERC20.sol";
 
 /**
@@ -42,12 +43,22 @@ abstract contract PaymasterERC20Guarantor is PaymasterERC20 {
      * For guaranteed ops, `prefundAmount` is inflated by {_guaranteedPostOpCost} worth of tokens
      * so the prefund pulled from the guarantor covers the extra postOp work done in {_refund}
      * ({SafeERC20-trySafeTransferFrom} from the user + {SafeERC20-trySafeTransfer} to the guarantor).
+     *
+     * Guaranteed ops whose `paymasterPostOpGasLimit` cannot cover the guaranteed {_refund}
+     * ({PaymasterERC20-_postOpCost} + {_guaranteedPostOpCost}) are rejected with `SIG_VALIDATION_FAILED`.
+     * The floor uses the value returned by those virtuals, so an integrator override that under-estimates
+     * the actual token-specific cost reintroduces the strand-the-prefund failure mode described in
+     * {PaymasterERC20-_postOp}. Size {PaymasterERC20-_postOpCost} and {_guaranteedPostOpCost} for the
+     * specific ERC-20 accepted by the paymaster.
+     *
+     * Provisioning exactly the floor carries no unused-gas penalty: {_postOpGasBudget} covers it, so
+     * {PaymasterERC20-_postOpGasPenalty} only prices the limit provisioned on top of it.
      */
     function _prefund(
         PackedUserOperation calldata userOp,
         bytes32 userOpHash,
         IERC20 token,
-        uint256 tokenPrice,
+        uint256 tokenPerNative,
         address prefunder_,
         uint256 prefundAmount_
     )
@@ -56,15 +67,20 @@ abstract contract PaymasterERC20Guarantor is PaymasterERC20 {
         override
         returns (bool success, address prefunder, uint256 prefundAmount, bytes memory prefundContext)
     {
-        address guarantor = _fetchGuarantor(userOp);
+        address guarantor = _guarantorOf(userOp);
         bool isGuaranteed = guarantor != address(0);
 
         // If there is a guarantor, add more funds to cover the extra postOp cost
         // and set the guarantor as the prefunder.
         if (isGuaranteed) {
+            // Reject before pulling funds if the postOp gas budget can't cover the guaranteed {_refund};
+            // otherwise postOp reverts and strands the guarantor's prefund (see {PaymasterERC20-_postOp}).
+            if (userOp.paymasterPostOpGasLimit() < _postOpCost() + _guaranteedPostOpCost())
+                return (false, prefunder_, prefundAmount_, "");
+
             // `_erc20Cost` may return `type(uint256).max` as an overflow sentinel. `saturatingAdd` preserves it
             // so the bad value reaches `trySafeTransferFrom` and fails there, instead of reverting here.
-            uint256 guaranteedPostOpCost = _erc20Cost(_guaranteedPostOpCost() * userOp.maxFeePerGas(), tokenPrice);
+            uint256 guaranteedPostOpCost = _erc20Cost(_guaranteedPostOpCost() * userOp.maxFeePerGas(), tokenPerNative);
             prefundAmount_ = prefundAmount_.saturatingAdd(guaranteedPostOpCost);
             prefunder_ = guarantor;
         }
@@ -72,29 +88,35 @@ abstract contract PaymasterERC20Guarantor is PaymasterERC20 {
             userOp,
             userOpHash,
             token,
-            tokenPrice,
+            tokenPerNative,
             prefunder_,
             prefundAmount_
         );
         if (prefunder == guarantor) {
             emit UserOperationGuaranteed(userOpHash, prefunder, prefundAmount);
         }
-        return (success, prefunder, prefundAmount_, abi.encodePacked(prefundContext, userOp.sender));
+        return (success, prefunder, prefundAmount, abi.encodePacked(prefundContext, userOp.sender));
     }
 
     /**
      * @dev Handles the refund process for guaranteed operations.
      *
-     * * **Non-guaranteed** (`prefunder == userOp.sender`): pass the base `actualAmount` through to
-     *   {PaymasterERC20-_refund}.
+     * * **Non-guaranteed** (`prefunder == userOp.sender`): forward to {PaymasterERC20-_refund} and
+     *   propagate the effective amount returned by `super._refund` so downstream extensions can
+     *   report their actual charge (e.g. a fixed-credit policy that reduces the settlement).
      * * **Guaranteed**: augment `actualAmount` by {_guaranteedPostOpCost} * `actualUserOpFeePerGas`
      *   (priced in tokens), pull it from `userOp.sender`, and call {PaymasterERC20-_refund} with
      *   `actualAmount = 0` so the guarantor gets the full `prefundAmount` back. If the user fails to pay,
      *   the guarantor absorbs the GUARANTEED cost (not the base cost).
+     *
+     * NOTE: For guaranteed ops, the returned `effectiveAmount` mirrors the value emitted in
+     * {UserOperationGuaranteed}: the guarantor's inflated `actualAmount`, not necessarily the
+     * amount that `super._refund` settled. Only the non-guaranteed branch propagates what a
+     * downstream extension actually charged.
      */
     function _refund(
         IERC20 token,
-        uint256 tokenPrice,
+        uint256 tokenPerNative,
         uint256 actualAmount,
         uint256 actualUserOpFeePerGas,
         address prefunder,
@@ -114,7 +136,10 @@ abstract contract PaymasterERC20Guarantor is PaymasterERC20 {
             // If the values used here are able to cause that _erc20Cost math to fail (and return type(uint256).max),
             // then the same failure must have already happened in the _prefund phase, causing the whole userOp to
             // fail before even reaching this point.
-            uint256 guaranteedPostOpAmount = _erc20Cost(_guaranteedPostOpCost() * actualUserOpFeePerGas, tokenPrice);
+            uint256 guaranteedPostOpAmount = _erc20Cost(
+                _guaranteedPostOpCost() * actualUserOpFeePerGas,
+                tokenPerNative
+            );
             actualAmount += guaranteedPostOpAmount;
             effectiveAmount = actualAmount;
 
@@ -122,33 +147,54 @@ abstract contract PaymasterERC20Guarantor is PaymasterERC20 {
             if (token.trySafeTransferFrom(userOpSender, address(this), actualAmount)) {
                 actualAmount = 0;
             }
-        } else {
-            effectiveAmount = actualAmount;
         }
 
-        (refunded, ) = super._refund(
+        uint256 returnedEffectiveAmount;
+        bytes calldata forwardedContext = prefundContext[:prefundContext.length - 20];
+        (refunded, returnedEffectiveAmount) = super._refund(
             token,
-            tokenPrice,
+            tokenPerNative,
             actualAmount,
             actualUserOpFeePerGas,
             prefunder,
             prefundAmount,
-            prefundContext[:prefundContext.length - 20]
+            forwardedContext
         );
+        return (refunded, Math.ternary(prefunder != userOpSender, effectiveAmount, returnedEffectiveAmount));
+    }
 
-        return (refunded, effectiveAmount);
+    /**
+     * @dev See {PaymasterERC20-_postOpGasBudget}. Widened by {_guaranteedPostOpCost} for guaranteed operations:
+     * that is the extra postOp gas they are billed, and which {_prefund} requires them to provision.
+     */
+    function _postOpGasBudget(PackedUserOperation calldata userOp) internal view virtual override returns (uint256) {
+        return
+            super._postOpGasBudget(userOp) +
+            Math.ternary(_guarantorOf(userOp) == address(0), 0, _guaranteedPostOpCost());
     }
 
     /**
      * @dev Fetches the guarantor address and validation data from the user operation.
      *
      * NOTE: Return `address(0)` to disable the guarantor feature. If supported, ensure
-     * explicit consent (e.g., signature verification) to prevent unauthorized use.
+     * explicit consent (e.g., signature verification) to prevent unauthorized use. Returning
+     * `userOp.sender` is equivalent to returning `address(0)`: the operation is not guaranteed.
      */
     function _fetchGuarantor(PackedUserOperation calldata userOp) internal view virtual returns (address guarantor);
 
-    /// @dev Over-estimates the cost of the post-operation logic. Added on top of {PaymasterERC20-_postOpCost} for guaranteed userOps.
+    /**
+     * @dev Over-estimates the cost of the post-operation logic. Added on top of {PaymasterERC20-_postOpCost} for
+     * guaranteed userOps.
+     *
+     * NOTE: Like {PaymasterERC20-_postOpCost}, override with a higher value for gas-heavier tokens.
+     */
     function _guaranteedPostOpCost() internal view virtual returns (uint256) {
         return 15_000;
+    }
+
+    /// @dev Returns the guarantor given by {_fetchGuarantor}, or `address(0)` if the sender is its own guarantor.
+    function _guarantorOf(PackedUserOperation calldata userOp) private view returns (address) {
+        address guarantor = _fetchGuarantor(userOp);
+        return address(uint160(Math.ternary(guarantor == userOp.sender, 0, uint160(guarantor))));
     }
 }
